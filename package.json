@@ -1,0 +1,38 @@
+{
+  "name": "realtime-interview-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows desktop assistant that listens to a meeting, detects interviewer questions and streams suggested answers into a floating overlay.",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "dev": "npm run dev -w @ria/desktop",
+    "build": "npm run build -w @ria/desktop",
+    "package": "npm run package -w @ria/desktop",
+    "package:win": "npm run package:win -w @ria/desktop",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "npm run test:e2e -w @ria/desktop",
+    "lint": "eslint .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "eslint": "^10.11.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.9",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^5.0.3"
+  }
+}

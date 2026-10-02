@@ -1,0 +1,13 @@
+{
+  "name": "@ria/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Types, IPC contract and utilities shared by every process.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}
