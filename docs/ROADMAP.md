@@ -61,10 +61,13 @@ CI runners have no audio devices, so device tests are manual and their results a
 Transcription and answer generation go through provider interfaces
 (`TranscriptionProvider`, `LlmProvider`), so the vendor is a setting, not a rewrite.
 
-| Role | Default (free tier) | Alternatives |
-|---|---|---|
-| Speech-to-text | Groq `whisper-large-v3-turbo`, sent one VAD speech segment at a time | Local `whisper.cpp` (offline); OpenAI realtime transcription or Gemini Live (true streaming deltas) |
-| Answer LLM | Google Gemini Flash, streaming | Groq-hosted open models; local Ollama; OpenAI |
+| Role | Default (free tier) | Paid, low-cost real-time | Other alternatives |
+|---|---|---|---|
+| Speech-to-text | Groq `whisper-large-v3-turbo`, sent one VAD speech segment at a time | AssemblyAI Universal-Streaming or Deepgram Nova-3 (streaming WebSocket); OpenAI `gpt-live-transcribe` | Local `whisper.cpp` (offline); Gemini Live |
+| Answer LLM | Google Gemini Flash, streaming | `gpt-oss-120b` on Groq or Cerebras (fastest); Gemini Flash paid tier; GPT-5 mini with minimal reasoning | Local Ollama |
+
+Every run records which provider and model it used in `sessions.configuration`, so
+results from different providers are compared rather than mixed.
 
 Trade-off: Whisper on Groq is not a streaming API. You get one final transcript per
 speech segment instead of word-by-word deltas. Because the pipeline already cuts audio
