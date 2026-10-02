@@ -1,0 +1,14 @@
+appId: dev.research.ria
+productName: Realtime Interview Assistant
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**
+  - package.json
+win:
+  target:
+    - portable
+  artifactName: RealtimeInterviewAssistant-${version}-portable.exe
+portable:
+  artifactName: RealtimeInterviewAssistant-${version}-portable.exe

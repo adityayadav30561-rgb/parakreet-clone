@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "jsx": "react-jsx"
+  },
+  "include": ["electron", "preload", "electron.vite.config.ts"]
+}

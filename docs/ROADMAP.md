@@ -1,175 +1,223 @@
-# Implementation Roadmap — Realtime Interview Assistant
+# Implementation Roadmap — Assistant Detection Study
 
-This roadmap builds the **application first**. The research work from the original brief
-(Capture Laboratory, experiment data collection, evaluation scripts, research-paper
-material) is **parked** until the app is finished and judged worth writing up. See
-[Parked for later](#parked-for-later).
+## Purpose
 
-The build is split into **6 stages**. Each stage ends with a **gate**: a short list of
-things that must actually be shown to work before the next stage starts. The original
-phase numbers are kept so the brief and this plan can be cross-referenced.
+This project supports a research paper on **how real-time "interview assistant" tools
+work and how to detect them**. It builds, in one controlled test environment on the
+researcher's own machines:
 
-## Changes from the brief's ordering
+1. A **visible** real-time assistant (mic + application-audio capture, VAD, transcription, question detection, streamed answers, latency measurement) — so every layer of how these tools work is understood and documented.
+2. A **research marker window** that can request Windows' documented capture-exclusion API, used as a detection target.
+3. A **detector** (separate process) that tries to identify a running assistant from legitimate local signals.
+4. A **test bench** (meeting simulator) so every experiment is reproducible.
+5. An **experiment record** and evaluation so results are measured, not asserted.
 
-| Change | Why |
-|---|---|
-| **Research phases 14, 16, 17, 21 are parked** | Build and prove the product first; research only if it is worth it. |
-| **Security (19)** and the **error surface (18)** start in Stage 0 as baseline rules | Context isolation, typed IPC, keeping secrets out of the renderer, and visible errors are much cheaper to build in from the start than to add later. Stage 5 is then an audit, not a rewrite. |
-| **Latency timestamps and a small SQLite store move into Stage 2** | The latency readout (Phase 12) is a product feature, and it only works if timestamps exist from the first audio frame. Adding them after the pipeline is built means touching every module again. |
-| **Test audio clips from the Test Meeting Simulator (15) move into Stage 2** | Loopback capture, VAD and transcription each need repeatable, known audio to test against. The full simulator comes in Stage 4 as a development test tool. |
-| **Microphone and loopback both use native WASAPI** (not `getUserMedia` for the mic) | Both streams then share one clock (`QueryPerformanceCounter`), which keeps turn ordering (Phase 8) and latency numbers correct. |
-| **Capture exclusion (3) starts with Electron's `setContentProtection`** before writing a native addon | On Windows 10 2004+ Electron already calls `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. The native addon is then only needed for what Electron does not expose: reading back the current affinity with `GetWindowDisplayAffinity`, `GetLastError`, and the OS build number. |
+## Scope boundary (read before building)
 
-## Native architecture decision
+This is a **defensive / detection** study. Two things follow from that and are fixed:
+
+- **The live-answer assistant overlay is never capture-excluded.** The assistant window
+  is always visible to screen capture. The capture-exclusion API
+  (`SetWindowDisplayAffinity` / `WDA_EXCLUDEFROMCAPTURE`) is applied only to a dedicated
+  **research marker window** that carries no answer content. See
+  [Why the marker window](#why-the-marker-window-and-not-the-answer-overlay) — it costs
+  the study no data, because a local detector is indifferent to which window holds the
+  answers.
+- **No evasion or anti-detection work, ever.** Not in any phase: no process-name
+  spoofing, no process / Task Manager hiding, no injection into meeting apps, no
+  bypassing security, anti-cheat or proctoring software, no undocumented or kernel
+  techniques, and nothing built specifically to defeat the detector. The detector is
+  meant to win; the experiment measures whether it does.
+
+The research questions are detection questions:
+
+1. Does `WDA_EXCLUDEFROMCAPTURE` change what different capture mechanisms record?
+2. Can a separate local detector still identify the assistant when capture exclusion is active?
+3. Which observable local signals are useful for detection?
+4. How much latency does the assistant pipeline introduce?
+5. How reliable is detection across Windows versions and capture methods?
+
+## Why the marker window, and not the answer overlay
+
+The detector runs **locally**. `WDA_EXCLUDEFROMCAPTURE` only changes what a **remote
+screen-share or recording** captures; it does nothing to hide a window from another
+process on the same machine enumerating the window manager. So every detection signal is
+observable without putting answers in the excluded window:
+
+| Signal | How the detector reads it | Needs answers in the excluded window? |
+|---|---|---|
+| Display-affinity / capture-exclusion state | `GetWindowDisplayAffinity` on each top-level window | No |
+| Process information | process list, module list | No |
+| Window properties (size, class, owner) | window enumeration | No |
+| Always-on-top | `GetWindowLong` ex-styles | No |
+| Transparency / layered | ex-styles + `GetLayeredWindowAttributes` | No |
+| Audio capture / application-loopback activity | audio session enumeration | No |
+| Question → answer timing | correlates the assistant's own audio-in and answer-generation events (process / telemetry level) | No — observed on the visible assistant |
+
+Merging the answer pipeline into the capture-excluded window would add a single binary
+that both generates live answers and hides from the interviewer — the deployable misuse
+artifact — while contributing **zero** additional detector data. So the marker window
+carries the capture-exclusion toggle, the assistant stays visible, and the detector is
+exercised against both.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+  subgraph Machine["One research machine"]
+    subgraph Assistant["Assistant process (Electron, VISIBLE)"]
+      MAIN[Main: audio, transcription,<br/>question detection, answer engine, telemetry]
+      OVR[Answer overlay<br/>always visible to capture]
+      MARK[Research marker window<br/>optional WDA_EXCLUDEFROMCAPTURE]
+      MAIN --- OVR
+      MAIN --- MARK
+    end
+    SIM[Meeting simulator<br/>scripted questions]
+    DET[Detector process<br/>window + process + audio signals]
+    DB[(SQLite:<br/>experiments, telemetry)]
+    SIM -->|audio| MAIN
+    MAIN -->|telemetry| DB
+    DET -->|signals + verdict| DB
+    DET -.observes.-> Assistant
+  end
+  CAP[Screen capture / share<br/>Zoom, Teams, Meet, Snipping Tool]
+  Assistant -.what capture sees.-> CAP
+  CAP -->|recorded result| DB
+```
+
+Assistant and detector are **separate processes** and stay that way. They communicate
+only indirectly, through the OS (the detector observes) and the shared experiment
+database (both write results).
+
+### Native components
 
 | Component | Form | Reason |
 |---|---|---|
-| Display affinity (Phase 3) | Small N-API addon (`node-addon-api` + `cmake-js`), called from Electron **main** | Synchronous calls on an HWND that main already owns. |
-| Audio capture (Phases 4–5) | Separate C++ helper process (`native/windows-audio` → `audio-helper.exe`) streaming framed PCM to main over a named pipe or stdout | A crash on an audio thread cannot take down Electron. There is no Electron ABI rebuild for the audio code. It can be tested on its own with a CLI that writes WAV files. |
+| Display affinity (marker window) + window/affinity readback (detector) | N-API addon (`node-addon-api` + `cmake-js`), called from each process's main | Synchronous Win32 calls on an HWND the process owns; `GetWindowDisplayAffinity`, `GetWindowLong`, enumeration. |
+| Audio capture (mic + application loopback) | Separate C++ helper process (`native/windows-audio` → `audio-helper.exe`) streaming framed PCM to main | A crash on an audio thread cannot take down Electron; no Electron ABI rebuild; testable standalone writing WAV. |
 
-Wire format between the helper and main: `[header: streamId u8 | sampleRate u32 | channels u8 | qpcTimestamp u64 | frameCount u32][PCM payload]`, versioned from day one.
+Wire format between helper and main: `[streamId u8 | sampleRate u32 | channels u8 | qpcTimestamp u64 | frameCount u32][PCM]`, versioned from day one.
 
 ## Development and testing workflow
 
-All development happens in Claude Code on the web (a Linux cloud container). Nothing is
-built on the Windows PC; it is only used to **run** builds and report results.
+All development happens in Claude Code on the web (Linux container). Nothing is built on
+the Windows PC; it only **runs** CI-produced builds and reports results.
 
 ```mermaid
 flowchart LR
-  A[Claude Code web<br/>write code + Linux tests] -->|git push| B[GitHub Actions<br/>windows-latest]
-  B -->|compile native + package .exe| C[Actions artifact<br/>portable .exe zip]
-  C -->|download| D[Your Windows PC<br/>run stage checklist]
-  D -->|diagnostics JSON + screenshots<br/>pasted into chat| A
+  A[Claude Code web<br/>code + Linux tests] -->|git push| B[GitHub Actions<br/>windows-latest]
+  B -->|build native + package .exe| C[Actions artifact]
+  C -->|download| D[Windows PC<br/>run stage checklist]
+  D -->|diagnostics JSON + screenshots| A
 ```
 
-| Verified in the cloud (Linux) | Verified by GitHub Actions (Windows runner) | Needs your Windows PC |
+| Verified in the cloud (Linux) | Verified by GitHub Actions (Windows) | Needs the Windows PC |
 |---|---|---|
-| Monorepo, TypeScript, lint, unit tests | Native C++ compiles, native unit tests | Overlay behavior (always-on-top, shortcuts, drag) |
-| Electron shell launch under `xvfb` (smoke test) | Packaged `.exe` builds and starts | `SetWindowDisplayAffinity` results |
-| All pure-TS packages (resampler, VAD, router, question detector, conversation manager, answer engine with mocked AI) | | WASAPI mic and loopback against real devices |
-| | | Real end-to-end latency, CPU and RAM |
+| Monorepo, TypeScript, lint, unit tests | Native C++ compiles, native unit tests | Overlay/marker behavior, always-on-top, shortcuts |
+| Electron shell under `xvfb` (smoke) | Packaged `.exe` builds and starts | `SetWindowDisplayAffinity` results vs. real capture |
+| Pure-TS packages (VAD, router, question detector, conversation, answer engine with mocked AI) | | WASAPI mic + loopback on real devices |
+| Detector signal logic against recorded fixtures | | Detector vs. live assistant + marker; latency, CPU, RAM |
 
-Supporting pieces, all built in Stage 0:
-
-- **Windows build workflow:** every push builds a portable `.exe` with `electron-builder` and uploads it as an Actions artifact.
-- **Test checklists:** `docs/testing/stage-N.md` lists exactly what to click and what to look for at each gate.
-- **Export Diagnostics:** a menu item that saves a JSON file with OS build, app version, device list, API results, errors and latency. API keys are never included. You paste it into chat.
-- **API keys in the packaged app:** a `.env` file is not shipped. Keys are entered on a Settings screen and stored encrypted by Electron main (`safeStorage`, which uses Windows DPAPI). The renderer never sees them.
-
-CI runners have no audio devices, so device tests are done manually on your PC and their
-results are noted in `docs/testing/results/`.
+Built in Stage 0: the Windows `.exe` artifact workflow, `docs/testing/stage-N.md`
+checklists, an **Export Diagnostics** menu item (OS build, versions, devices, errors,
+latency — never API keys), and encrypted API-key storage (`safeStorage`, Windows DPAPI;
+the renderer never sees keys).
 
 ## AI providers (free-first, swappable)
 
-Transcription and answer generation go through provider interfaces
-(`TranscriptionProvider`, `LlmProvider`), so the vendor is a setting, not a rewrite.
+Transcription and answers go through provider interfaces (`TranscriptionProvider`,
+`LlmProvider`); the vendor is a setting.
 
-| Role | Default (free tier) | Paid, low-cost real-time | Other alternatives |
+| Role | Default (free) | Paid, low-cost real-time | Other |
 |---|---|---|---|
-| Speech-to-text | Groq `whisper-large-v3-turbo`, sent one VAD speech segment at a time | AssemblyAI Universal-Streaming or Deepgram Nova-3 (streaming WebSocket); OpenAI `gpt-live-transcribe` | Local `whisper.cpp` (offline); Gemini Live |
-| Answer LLM | Google Gemini Flash, streaming | `gpt-oss-120b` on Groq or Cerebras (fastest); Gemini Flash paid tier; GPT-5 mini with minimal reasoning | Local Ollama |
+| Speech-to-text | Groq `whisper-large-v3-turbo`, one VAD segment at a time | AssemblyAI Universal-Streaming or Deepgram Nova-3; OpenAI `gpt-live-transcribe` | Local `whisper.cpp`; Gemini Live |
+| Answer LLM | Google Gemini Flash, streaming | `gpt-oss-120b` on Groq / Cerebras; Gemini Flash paid; GPT-5 mini (minimal reasoning) | Local Ollama |
 
-Trade-off: Whisper on Groq is not a streaming API. You get one final transcript per
-speech segment instead of word-by-word deltas. Because the pipeline already cuts audio
-into segments with VAD (Phase 6), this costs roughly the time of one HTTP round trip per
-segment. Phase 7's streaming-delta path is kept for providers that support it.
-
-Free-tier quotas and terms change. Check each provider's console when the key is created.
-Free tiers may use prompts to improve the provider's models, so test with simulator data,
-not real personal information.
+Free tiers may train on prompts — test with simulator data, never real personal
+information. Quotas change; check each console when creating a key.
 
 ---
 
-## Stage 0 — Foundation & desktop shell
-**Phases: 0, 1 (+ baselines of 18, 19)**
+## Stage 0 — Foundation
+Project foundation and desktop shell, security baseline, CI + Windows build, Settings
+(encrypted keys), diagnostics export. **Covers original Phases 0, 1 and the security /
+error baseline.**
 
-- npm workspaces monorepo: `apps/desktop/{electron,preload,renderer}`, `apps/server`, `packages/{shared,audio,realtime,conversation,ui}`, `native/windows-audio`, `tests`, `docs`, `scripts`
+- npm workspaces: `apps/{assistant,detector,simulator}`, `packages/{shared,audio,transcription,conversation,ui,detection}`, `native/windows-audio`, `native/win-affinity`, `tests`, `docs`, `scripts`
 - Electron + Vite + React + TypeScript (strict) + Tailwind; ESLint, Prettier, Vitest
-- Secure baseline: `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`, a strict CSP, and a typed IPC contract in `packages/shared` with runtime validation (zod) on every channel
-- Structured logger with secret redaction; an `AppError` type shown in the UI
-- `.env.example`, `.gitignore` (including `.env`), `README.md`, `CLAUDE.md`
-- Scripts: `dev`, `build`, `test`, `lint`, `typecheck`, `package`
-- Status UI showing mic, system audio and AI as "not connected", plus placeholder transcript, question, answer and latency panels
-- CI workflow (Linux + Windows) and the Windows portable-`.exe` artifact build
-- Export Diagnostics menu item; `docs/testing/stage-0.md` checklist; Settings screen with encrypted API-key storage
+- Security baseline: `contextIsolation`, `nodeIntegration:false`, `sandbox:true`, strict CSP, typed IPC with zod validation on every channel, structured logging with secret redaction, a user-facing `AppError`
+- CI (Linux + Windows), portable `.exe` artifact, Export Diagnostics, Settings screen, `docs/testing/stage-0.md`
 
-**Gate:** the downloaded `.exe` starts on your PC and its diagnostics export is pasted back; a test proves `window.require`/`process` are undefined in the renderer; an IPC round-trip test passes; typecheck, lint, test and build are all green in CI.
+**Gate:** downloaded `.exe` starts on the PC and its diagnostics export is pasted back; renderer cannot reach Node (`window.require`/`process` undefined); IPC round-trip test passes; typecheck, lint, test, build all green in CI.
 
-## Stage 1 — Assistant overlay window
-**Phases: 2, 3**
+## Stage 1 — Audio capture
+Native Windows capture of microphone and application/system audio as two separate,
+timestamped channels. **Original Phases 4, 5.** Diagnostics screen (sample rate,
+channels, frame size, RMS, peak, dropped frames, buffer latency) and A/B level meters.
 
-- `AssistantWindowManager`: frameless, transparent-capable, always-on-top, draggable, resizable, opacity, compact mode, global show/hide shortcut, position persisted per display. Fed by fake data only.
-- Capture exclusion setting: `setContentProtection` first, then the N-API addon `setDisplayAffinity(hwnd, NONE | EXCLUDEFROMCAPTURE)` plus readback.
-- Small status line in Settings: OS build, API result, `GetLastError`, current affinity.
-- `docs/windows-capture.md`, including the limitation: Windows does not guarantee exclusion from every capture method.
+**Gate (Windows):** a clip played through speakers appears on channel B only; mic speech on channel A only; ~0 dropped frames over 10 min.
 
-**Gate (Windows):** the overlay behaves as specified with fake data; the affinity goes NONE → EXCLUDE → NONE and the readback confirms each step.
+## Stage 2 — Speech pipeline
+VAD, live transcription behind `TranscriptionProvider`, and channel-based speaker
+labelling (USER / INTERVIEWER / UNKNOWN). **Original Phases 6, 7, 8.** Timestamps and a
+SQLite store (`sessions`, `transcripts`, `latency_events`, `errors`) land here so timing
+exists from the first frame.
 
-## Stage 2 — Audio engine
-**Phases: 4, 5, 6 (+ latency timestamps from 12, + test audio clips from 15)**
+**Gate:** provider tested against a mock server (Linux); transcripts of test clips match expected text closely; on Windows both streams transcribe live with correct routing.
 
-1. **Timestamps and storage first:** `packages/shared` defines `TimingEvent`; SQLite (`better-sqlite3`, in main) has `sessions`, `latency_events` and `errors` tables plus a migration runner.
-2. **Test audio clips:** a set of WAV files (the four sample interviewer questions, silence, noise, overlapping speech) with expected transcripts and timestamps in `tests/fixtures/audio/`.
-3. **Phase 4 – mic:** WASAPI capture in `audio-helper.exe`; an `AudioSource` interface in TS (`start/stop/pause/resume/getDevices/setDevice/onAudioFrame`); an audio diagnostics screen showing sample rate, channels, frame size, RMS, peak, dropped frames and buffer latency.
-4. **Phase 5 – loopback:** process loopback through `ActivateAudioInterfaceAsync` (process plus child processes), falling back to system loopback; streams tagged `MICROPHONE_AUDIO`, `SYSTEM_AUDIO` or `APPLICATION_AUDIO`; two-channel A/B meters; `docs/audio-pipeline.md` covering the full chain from the Windows Audio Engine through IAudioClient to the transcription provider.
-5. **Phase 6 – processing (pure TS, fully unit-tested):** resample, downmix, PCM16, normalize, energy VAD with configurable thresholds, and segmenting into `AudioFrame`, `SpeechSegment`, `AudioStream` and `Turn`.
+## Stage 3 — Assistant (visible)
+Question detection, conversation memory with an explicit `CandidateProfile`, and a
+streamed answer engine shown in an **always-visible** overlay with a per-stage latency
+readout. **Original Phases 9, 10, 11, 12, 13.**
 
-**Gate:** VAD and segmentation unit tests pass against the test clips (Linux). On Windows: a clip played through the speakers appears on channel B only; speech into the mic appears on channel A only; dropped frames are about 0 over 10 minutes.
+**Gate:** question-detector precision/recall on labelled transcripts; answer-engine tests (streaming, cancellation, word limit) with a mocked model; on Windows, spoken question → streamed answer with latency shown.
 
-## Stage 3 — Speech pipeline
-**Phases: 7, 8**
+## Stage 4 — Test bench
+Meeting simulator that plays the scripted interviewer questions in a fake meeting window,
+for repeatable runs. **Original Phase 15.** Sessions recorded to SQLite.
 
-- At the start of this stage, check the current docs for the chosen provider (model IDs, event names, quotas) rather than trusting older notes.
-- `TranscriptionProvider` interface with a segment-based Groq Whisper implementation first (free); a streaming implementation (AssemblyAI, Deepgram or OpenAI) behind the same interface.
-- `RealtimeTranscriptionClient` (streaming providers) runs in main/server only (`connect`, `disconnect`, `sendAudio`, `commitTurn`, `onTranscriptDelta`, `onTranscriptFinal`, `onError`) over WebSocket, with reconnect and backoff.
-- Two independent sessions: USER (mic) and INTERVIEWER (loopback). Partial and final transcripts with timestamps, source and latency.
-- `ConversationRouter`: source channel → USER, INTERVIEWER or UNKNOWN, ordered by QPC timestamp; UNKNOWN when confidence is low (for example, both channels speaking at once).
+**Gate:** one command runs a scripted session end to end and records it.
 
-**Gate:** the client passes tests against a mock server (Linux); an integration test checks that transcripts of the test clips match the expected text closely. On Windows: both transcripts stream live and the routing is correct.
+## Stage 5 — Detector (separate process)
+A standalone detector that enumerates windows and processes and reads the signals in the
+[table above](#why-the-marker-window-and-not-the-answer-overlay): capture-exclusion /
+display-affinity state, process info, window properties, always-on-top, transparency,
+audio-capture / application-loopback activity, and the question→answer timing
+relationship. It emits a verdict with the signals that fired. **New; realises the study's
+detection goal. Original Phase 14's capture tests fold in here.**
 
-## Stage 4 — Intelligence & finished UI
-**Phases: 9, 10, 11, 12, 13, 15**
+**Gate:** detector unit tests over recorded signal fixtures (Linux); on Windows it identifies the running assistant and reports which signals fired.
 
-- **9 `QuestionDetector`:** punctuation, interrogative and imperative patterns, pause length after the utterance, and conversation state; an optional LLM classifier only for ambiguous cases. Emits a `QuestionEvent` (`id`, `text`, `startTime`, `endTime`, `confidence`). It does not fire on fragments.
-- **10 `ConversationManager`:** turns, questions and answers; recent and session context; a `CandidateProfile` that the user enters explicitly. Nothing is inferred or invented. Session history (transcripts, questions, answers) is saved in SQLite.
-- **11 `AnswerEngine`** over an `LlmProvider` interface (Gemini Flash by default): streaming, first person, 60–100 words by default, configurable length, tone and detail; the prompt is grounded only in the profile and the transcript.
-- **12 Latency:** a `TOTAL LATENCY` readout plus a per-stage breakdown (capture → VAD → transcription → question detection → first answer token → UI). Optimize only where the numbers show the time goes.
-- **13 Final overlay:** question, streaming answer, key points, status (Listening / Processing / Answer ready), latency, and a **Debug panel** toggle for transcript and question confidence, audio source and token timing.
-- **15 Test Meeting Simulator:** a small local app that plays the scripted interviewer questions with a fake meeting window, so the whole pipeline can be tested the same way every time without a real call.
+## Stage 6 — Research modes, experiments, evaluation
+- **Research Settings panel** with two explicit modes (never auto-enabled):
+  - **Normal research mode:** no window capture-excluded; assistant visible; detector active; all telemetry recorded.
+  - **Capture-exclusion research mode:** the **marker window** requests `WDA_EXCLUDEFROMCAPTURE`; the assistant overlay stays visible to the local user; detector active; the screen-capture result and the detector result are both recorded.
+- **Experiment record** (SQLite + CSV/JSON export): `experiment_id`, `timestamp`, Windows version, assistant mode, display-affinity mode, simulator state, detector state, capture method, whether the assistant/marker appeared in capture, whether the detector identified it, detection signals, false-positive / false-negative classification, latency metrics.
+- **Evaluation scripts:** detector true/false positive and negative rates across Windows versions and capture methods; latency; optionally a comparison run against commercially available tools the researcher installs themselves. **Original Phases 16, 17.**
 
-**Gate:** question-detector unit tests pass on a set of labeled sample transcripts; answer-engine tests with a mocked model cover streaming, cancellation and the word limit; on Windows, a simulator run goes from spoken question to streamed answer in the overlay with the latency readout shown.
+**Gate:** a scripted experiment in each mode produces a complete experiment record and export; evaluation scripts run on it; results recorded as measured.
 
-## Stage 5 — Hardening & release
-**Phases: 18, 19, 20**
+## Stage 7 — Hardening & paper material
+Fault injection for every failure path (no mic, permission denied, no loopback, API down,
+network / socket drop, malformed audio, timeouts, native crash, unsupported Windows),
+each with a clear UI error; security audit against the Stage 0 baseline; `docs/` with
+Mermaid diagrams; `research/` methodology, metrics, limitations. **Original Phases 18, 19,
+20, 21.**
 
-- **18:** a fault-injection test for every failure listed in the brief (no mic, permission denied, no loopback, API down, network drop, WebSocket drop, malformed audio, timeouts, native helper crash, unsupported Windows build). Each one shows a clear UI error.
-- **19:** security audit against the Stage 0 baseline (IPC surface, CSP, secret handling, logs, dependency audit).
-- **20:** `docs/` set with Mermaid diagrams: architecture, audio pipeline, transcription pipeline, Windows capture, latency, troubleshooting.
-
-**Gate:** all fault-injection tests pass; there are no secrets in logs or the renderer bundle; the docs are complete; a release `.exe` is published from CI.
+**Gate:** fault tests pass; no secrets in logs or the renderer bundle; docs and research write-ups complete; a release `.exe` published from CI.
 
 ---
-
-## Parked for later
-
-These phases are not built now. They are picked up only if the finished app is worth a
-research write-up.
-
-| Phase | What it was | Why parking it costs little |
-|---|---|---|
-| **14** Capture Laboratory | Systematic tests of which capture methods include or exclude the overlay | The capture-exclusion setting and its readback already exist from Stage 1. |
-| **16** Research data collection | Experiment tables, `experiment_id`, CSV/JSON export | Sessions, latency events, transcripts, questions and answers are already stored in SQLite from Stages 2–4. Adding exports is a small change. |
-| **17** Evaluation | Scripts for WER, question-detection accuracy, answer relevance, hallucination rate, CPU/RAM | The Test Meeting Simulator and test clips from Stage 4 are the inputs these scripts would use. |
-| **21** Research paper material | Methodology, experiment design, metrics, prompting comparisons | Needs only documentation once the data above exists. |
 
 ## Working rules per phase
 
 1. Inspect the repo, then state a short plan.
 2. Build the smallest complete increment.
-3. Run typecheck, lint, unit tests and build. Fix failures; never report "should work".
-4. State exactly what could not be tested here (usually Windows/device-specific items) and what to verify manually.
-5. Update the docs, commit, push, and stop at the gate.
+3. Run typecheck, lint, unit tests, build. Fix failures; never report "should work".
+4. State exactly what could not be tested here (usually Windows/device items) and what to verify manually.
+5. Update docs, commit, push, stop at the gate.
 
 ## Next step
 
-**Stage 0** (Phases 0 + 1). Stop after the Electron shell launches and the gate checks pass.
+Finish **Stage 0**, then show the updated architecture and the exact Stage 1 plan.

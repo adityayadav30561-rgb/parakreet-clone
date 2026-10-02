@@ -1,11 +1,5 @@
 /** Connection state of one subsystem, as shown in the status panel. */
-export const CONNECTION_STATES = [
-  'not-connected',
-  'connecting',
-  'connected',
-  'error',
-  'unavailable',
-] as const;
+export const CONNECTION_STATES = ['not-connected', 'connecting', 'connected', 'error', 'unavailable'] as const;
 
 export type ConnectionState = (typeof CONNECTION_STATES)[number];
 
